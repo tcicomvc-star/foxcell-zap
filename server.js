@@ -28,6 +28,67 @@ let isStarting = false;
 
 const logger = pino({ level: "silent" });
 
+const SYNC_URL = process.env.SYNC_URL || "https://www.avenda.online/sistema/api/whatsapp_auth_sync.php";
+let syncTimeout = null;
+
+// Salvar todos os arquivos de autenticação no banco da HostGator
+async function salvarSessaoRemota() {
+    if (syncTimeout) clearTimeout(syncTimeout);
+    syncTimeout = setTimeout(async () => {
+        try {
+            if (!fs.existsSync(AUTH_FOLDER)) return;
+            const files = fs.readdirSync(AUTH_FOLDER);
+            if (!files.includes("creds.json")) return;
+
+            const sessionData = {};
+            for (const file of files) {
+                const filePath = path.join(AUTH_FOLDER, file);
+                if (fs.statSync(filePath).isFile()) {
+                    sessionData[file] = fs.readFileSync(filePath, "utf-8");
+                }
+            }
+
+            await axios.post(SYNC_URL, { session_data: sessionData }, { timeout: 15000 });
+            console.log(`[FOXCELL] 💾 Sessão do WhatsApp SINCRONIZADA no banco da HostGator (${Object.keys(sessionData).length} arquivos salvos).`);
+        } catch (err) {
+            console.error("[FOXCELL] Aviso ao salvar sessão na HostGator:", err.message);
+        }
+    }, 3000);
+}
+
+// Restaurar os arquivos de autenticação a partir do banco da HostGator
+async function restaurarSessaoRemota() {
+    try {
+        if (fs.existsSync(AUTH_FOLDER) && fs.existsSync(path.join(AUTH_FOLDER, "creds.json"))) {
+            console.log("[FOXCELL] Sessão local já existente.");
+            return true;
+        }
+
+        console.log("[FOXCELL] Buscando sessão salva no banco da HostGator...");
+        const resp = await axios.get(SYNC_URL, { timeout: 12000 });
+        if (resp.data?.tem_sessao && resp.data?.session_data) {
+            if (!fs.existsSync(AUTH_FOLDER)) {
+                fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+            }
+
+            const sessionData = resp.data.session_data;
+            let count = 0;
+            for (const [filename, content] of Object.entries(sessionData)) {
+                fs.writeFileSync(path.join(AUTH_FOLDER, filename), content, "utf-8");
+                count++;
+            }
+
+            console.log(`[FOXCELL] 🔄 Sessão RESTAURADA com sucesso da HostGator (${count} arquivos)! Conectando sem QR Code...`);
+            return true;
+        } else {
+            console.log("[FOXCELL] Nenhuma sessão salva encontrada na HostGator. Aguardando leitura de QR Code.");
+        }
+    } catch (err) {
+        console.error("[FOXCELL] Aviso ao restaurar sessão da HostGator:", err.message);
+    }
+    return false;
+}
+
 // Encerrar socket anterior para evitar conflito 440 (connection replaced)
 function encerrarSocketAtual() {
     if (sock) {
@@ -35,13 +96,16 @@ function encerrarSocketAtual() {
             sock.ev.removeAllListeners("connection.update");
             sock.ev.removeAllListeners("creds.update");
             sock.ev.removeAllListeners("messages.upsert");
-            sock.ws?.close();
-            sock.end();
+            if (sock.ws) {
+                sock.ws.close();
+            }
+            sock.end(undefined);
         } catch (e) {}
         sock = null;
     }
 }
 
+// Limpeza forçada de sessão
 async function limparSessao() {
     if (reconnectTimeout) {
         clearTimeout(reconnectTimeout);
@@ -52,11 +116,12 @@ async function limparSessao() {
         if (fs.existsSync(AUTH_FOLDER)) {
             fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
         }
+        await axios.get(`${SYNC_URL}?acao=limpar`, { timeout: 6000 }).catch(() => {});
     } catch (e) {}
     connectionStatus = "desconectado";
     currentQrCodeBase64 = null;
     connectedNumber = null;
-    console.log("[FOXCELL] Sessao limpa completamente.");
+    console.log("[FOXCELL] Sessão limpa completamente (local e banco da HostGator).");
 }
 
 function agendarReconexao(ms = 5000) {
@@ -90,7 +155,10 @@ async function iniciarWhatsApp() {
             keepAliveIntervalMs: 25000
         });
 
-        sock.ev.on("creds.update", saveCreds);
+        sock.ev.on("creds.update", async () => {
+            await saveCreds();
+            salvarSessaoRemota();
+        });
 
         sock.ev.on("connection.update", async (update) => {
             const { connection, lastDisconnect, qr } = update;
@@ -388,9 +456,10 @@ app.get("/test-webhook", async (req, res) => {
 });
 
 // Iniciar servidor e conexao
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     console.log(`=================================================`);
     console.log(`FOXCELL WHATSAPP SERVER RODANDO NA PORTA ${PORT}`);
     console.log(`=================================================`);
+    await restaurarSessaoRemota();
     iniciarWhatsApp();
 });
