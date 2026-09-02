@@ -135,15 +135,44 @@ async function iniciarWhatsApp() {
             }
         });
 
+const pendingTimers = new Map();
+const DELAY_RESPOSTA_MS = parseInt(process.env.DELAY_RESPOSTA_MS || "10000", 10); // 10 segundos de delay para atendimento humano
+
         // Recebimento de Mensagens
         sock.ev.on("messages.upsert", async ({ messages }) => {
             for (const msg of messages) {
-                if (!msg.message || msg.key.fromMe) continue;
-
                 const remoteJid = msg.key.remoteJid;
                 if (!remoteJid || remoteJid.includes("@g.us") || remoteJid === "status@broadcast") continue;
-
                 const phone = remoteJid.replace(/\D/g, "");
+
+                // Se foi o Alexandre (loja) quem enviou a mensagem pelo WhatsApp:
+                if (msg.key.fromMe) {
+                    console.log(`[FOXCELL] Atendente Alexandre respondeu para ${phone} (JID: ${remoteJid}).`);
+                    
+                    // Cancela qualquer envio automático pendente para este cliente
+                    if (pendingTimers.has(remoteJid)) {
+                        clearTimeout(pendingTimers.get(remoteJid));
+                        pendingTimers.delete(remoteJid);
+                        console.log(`[FOXCELL] Resposta da Agatha CANCELADA pois o atendente assumiu a conversa!`);
+                    }
+
+                    // Notifica a HostGator para registrar pausa humana de 1h no banco
+                    try {
+                        await axios.post(WEBHOOK_URL, {
+                            phone,
+                            jid: remoteJid,
+                            senderName: "Alexandre FoxCell",
+                            message: "atendente_assumiu",
+                            fromMe: true,
+                            isGroup: false
+                        }, { headers: { "Content-Type": "application/json" }, timeout: 6000 });
+                    } catch (e) {}
+
+                    continue;
+                }
+
+                if (!msg.message) continue;
+
                 const senderName = msg.pushName || "Cliente";
 
                 // Desembrulhar mensagens modernas do WhatsApp
@@ -164,27 +193,46 @@ async function iniciarWhatsApp() {
 
                 console.log(`[FOXCELL] Mensagem recebida de ${senderName} (${phone} | JID: ${remoteJid}): "${text}"`);
 
-                // Enviar para o Webhook do Sistema na HostGator (passando o jid original intacto!)
+                // 1. Simular status "Digitando..." no WhatsApp
                 try {
-                    const resp = await axios.post(
-                        WEBHOOK_URL,
-                        {
-                            phone,
-                            jid: remoteJid,
-                            senderName,
-                            message: text,
-                            fromMe: false,
-                            isGroup: false
-                        },
-                        { 
-                            headers: { "Content-Type": "application/json" },
-                            timeout: 25000 
-                        }
-                    );
-                    console.log(`[FOXCELL] Webhook HostGator respondeu status ${resp.status}`);
-                } catch (webhookErr) {
-                    console.error("[FOXCELL] Erro ao repassar para webhook HostGator:", webhookErr.message);
+                    await sock.sendPresenceUpdate("composing", remoteJid);
+                } catch (e) {}
+
+                // Se o cliente mandou mais de uma mensagem seguida, renova o timer para responder tudo de uma vez
+                if (pendingTimers.has(remoteJid)) {
+                    clearTimeout(pendingTimers.get(remoteJid));
                 }
+
+                // 2. Aguarda o Delay Humano (10 segundos) antes de responder
+                // Se o Alexandre mandar mensagem durante esses 10 segundos, a IA é cancelada na hora!
+                console.log(`[FOXCELL] Aguardando ${DELAY_RESPOSTA_MS / 1000}s de delay para ${senderName}. Se o Alexandre responder, a IA é cancelada.`);
+                
+                const timerId = setTimeout(async () => {
+                    pendingTimers.delete(remoteJid);
+                    try {
+                        console.log(`[FOXCELL] Enviando mensagem de ${senderName} para a Agatha na HostGator...`);
+                        const resp = await axios.post(
+                            WEBHOOK_URL,
+                            {
+                                phone,
+                                jid: remoteJid,
+                                senderName,
+                                message: text,
+                                fromMe: false,
+                                isGroup: false
+                            },
+                            { 
+                                headers: { "Content-Type": "application/json" },
+                                timeout: 25000 
+                            }
+                        );
+                        console.log(`[FOXCELL] Webhook HostGator respondeu status ${resp.status}`);
+                    } catch (webhookErr) {
+                        console.error("[FOXCELL] Erro ao repassar para webhook HostGator:", webhookErr.message);
+                    }
+                }, DELAY_RESPOSTA_MS);
+
+                pendingTimers.set(remoteJid, timerId);
             }
         });
     } catch (err) {
