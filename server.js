@@ -114,14 +114,12 @@ async function iniciarWhatsApp() {
         });
 
         // Recebimento de Mensagens
-        sock.ev.on("messages.upsert", async ({ messages, type }) => {
-            if (type !== "notify" && type !== "append") return;
-
+        sock.ev.on("messages.upsert", async ({ messages }) => {
             for (const msg of messages) {
                 if (!msg.message || msg.key.fromMe) continue;
 
                 const remoteJid = msg.key.remoteJid;
-                if (!remoteJid || remoteJid.includes("@g.us")) continue; // Ignorar grupos
+                if (!remoteJid || remoteJid.includes("@g.us") || remoteJid === "status@broadcast") continue;
 
                 const phone = remoteJid.replace(/\D/g, "");
                 const senderName = msg.pushName || "Cliente";
