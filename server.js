@@ -118,7 +118,6 @@ async function iniciarWhatsApp() {
                     await limparSessao();
                     agendarReconexao(2000);
                 } else if (statusCode === 440) {
-                    // Evitar ping-pong do code 440: aguarda estabilizar antes de tentar
                     console.log("[FOXCELL] Conexao substituida (code 440). Aguardando 8 segundos para estabilizar...");
                     agendarReconexao(8000);
                 } else {
@@ -163,14 +162,15 @@ async function iniciarWhatsApp() {
 
                 if (!text.trim()) continue;
 
-                console.log(`[FOXCELL] Mensagem recebida de ${senderName} (${phone}): "${text}"`);
+                console.log(`[FOXCELL] Mensagem recebida de ${senderName} (${phone} | JID: ${remoteJid}): "${text}"`);
 
-                // Enviar para o Webhook do Sistema na HostGator
+                // Enviar para o Webhook do Sistema na HostGator (passando o jid original intacto!)
                 try {
                     const resp = await axios.post(
                         WEBHOOK_URL,
                         {
                             phone,
+                            jid: remoteJid,
                             senderName,
                             message: text,
                             fromMe: false,
@@ -248,29 +248,41 @@ app.get("/qrcode", (req, res) => {
     });
 });
 
-// 4. Enviar Mensagem de Texto
+// 4. Enviar Mensagem de Texto (com suporte a JID direto, LID e número normal)
 app.post("/send-text", async (req, res) => {
-    const { phone, message } = req.body;
+    const { phone, jid: directJid, message } = req.body;
 
     if (!sock || connectionStatus !== "conectado") {
         return res.status(400).json({ sucesso: false, erro: "WhatsApp nao esta conectado" });
     }
 
-    if (!phone || !message) {
-        return res.status(400).json({ sucesso: false, erro: "Telefone e mensagem sao obrigatorios" });
+    if ((!phone && !directJid) || !message) {
+        return res.status(400).json({ sucesso: false, erro: "Telefone/JID e mensagem sao obrigatorios" });
     }
 
     try {
-        const cleanPhone = phone.replace(/\D/g, "");
-        let jid = `${cleanPhone}@s.whatsapp.net`;
+        let jid = directJid;
 
-        // Resolver JID oficial no WhatsApp (trata variacao de 8 ou 9 digitos no Brasil)
-        try {
-            const results = await sock.onWhatsApp(cleanPhone);
-            if (results && results[0] && results[0].jid) {
-                jid = results[0].jid;
+        if (!jid) {
+            const raw = String(phone || "").trim();
+            if (raw.includes("@")) {
+                jid = raw;
+            } else {
+                const clean = raw.replace(/\D/g, "");
+                // Se o identificador tiver mais de 13 dígitos, é um identificador de privacidade (LID) do WhatsApp!
+                if (clean.length > 13) {
+                    jid = `${clean}@lid`;
+                } else {
+                    jid = `${clean}@s.whatsapp.net`;
+                    try {
+                        const results = await sock.onWhatsApp(clean);
+                        if (results && results[0] && results[0].jid) {
+                            jid = results[0].jid;
+                        }
+                    } catch (waErr) {}
+                }
             }
-        } catch (waErr) {}
+        }
 
         await sock.sendMessage(jid, { text: message });
         console.log(`[FOXCELL] Resposta da Agatha enviada para ${jid}`);
