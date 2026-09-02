@@ -16,7 +16,6 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const API_SECRET = process.env.API_SECRET || "foxcell123";
 const WEBHOOK_URL = process.env.WEBHOOK_URL || "https://www.avenda.online/sistema/api/whatsapp_ia.php";
 const AUTH_FOLDER = "./auth_info_baileys";
 
@@ -24,17 +23,31 @@ let sock = null;
 let currentQrCodeBase64 = null;
 let connectionStatus = "desconectado"; // "desconectado" | "aguardando_qrcode" | "conectado"
 let connectedNumber = null;
-let isInitializing = false;
+let reconnectTimeout = null;
+let isStarting = false;
 
 const logger = pino({ level: "silent" });
 
+// Encerrar socket anterior para evitar conflito 440 (connection replaced)
+function encerrarSocketAtual() {
+    if (sock) {
+        try {
+            sock.ev.removeAllListeners("connection.update");
+            sock.ev.removeAllListeners("creds.update");
+            sock.ev.removeAllListeners("messages.upsert");
+            sock.ws?.close();
+            sock.end();
+        } catch (e) {}
+        sock = null;
+    }
+}
+
 async function limparSessao() {
-    try {
-        if (sock) {
-            try { await sock.logout(); } catch (e) {}
-            try { sock.end(); } catch (e) {}
-        }
-    } catch (e) {}
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+    }
+    encerrarSocketAtual();
     try {
         if (fs.existsSync(AUTH_FOLDER)) {
             fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
@@ -43,15 +56,25 @@ async function limparSessao() {
     connectionStatus = "desconectado";
     currentQrCodeBase64 = null;
     connectedNumber = null;
-    sock = null;
-    console.log("[FOXCELL] Sessao limpa com sucesso.");
+    console.log("[FOXCELL] Sessao limpa completamente.");
+}
+
+function agendarReconexao(ms = 5000) {
+    if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    reconnectTimeout = setTimeout(() => {
+        reconnectTimeout = null;
+        iniciarWhatsApp();
+    }, ms);
 }
 
 async function iniciarWhatsApp() {
-    if (isInitializing) return;
-    isInitializing = true;
+    if (isStarting) return;
+    isStarting = true;
 
     try {
+        // Matar qualquer conexao fantasma antes de iniciar uma nova
+        encerrarSocketAtual();
+
         const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
         const { version } = await fetchLatestBaileysVersion();
 
@@ -64,7 +87,7 @@ async function iniciarWhatsApp() {
             syncFullHistory: false,
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 0,
-            keepAliveIntervalMs: 10000
+            keepAliveIntervalMs: 25000
         });
 
         sock.ev.on("creds.update", saveCreds);
@@ -90,22 +113,22 @@ async function iniciarWhatsApp() {
                 currentQrCodeBase64 = null;
                 connectedNumber = null;
 
-                // Se foi desconectado pelo WhatsApp (logout, rejeicao 401/403/428)
-                if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403 || statusCode === 428) {
-                    console.log("[FOXCELL] Sessao rejeitada ou encerrada. Limpando credenciais antigas...");
-                    try {
-                        if (fs.existsSync(AUTH_FOLDER)) {
-                            fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-                        }
-                    } catch (e) {}
+                if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403) {
+                    console.log("[FOXCELL] Desconectado permanentemente. Limpando credenciais...");
+                    await limparSessao();
+                    agendarReconexao(2000);
+                } else if (statusCode === 440) {
+                    // Evitar ping-pong do code 440: aguarda estabilizar antes de tentar
+                    console.log("[FOXCELL] Conexao substituida (code 440). Aguardando 8 segundos para estabilizar...");
+                    agendarReconexao(8000);
+                } else {
+                    agendarReconexao(4000);
                 }
-
-                // Sempre agenda nova tentativa para nao deixar o servidor inativo
-                setTimeout(() => {
-                    isInitializing = false;
-                    iniciarWhatsApp();
-                }, 3000);
             } else if (connection === "open") {
+                if (reconnectTimeout) {
+                    clearTimeout(reconnectTimeout);
+                    reconnectTimeout = null;
+                }
                 connectionStatus = "conectado";
                 currentQrCodeBase64 = null;
                 connectedNumber = sock.user?.id?.split(":")[0] || "FoxCell";
@@ -166,12 +189,9 @@ async function iniciarWhatsApp() {
         });
     } catch (err) {
         console.error("[FOXCELL] Erro ao iniciar socket:", err);
-        setTimeout(() => {
-            isInitializing = false;
-            iniciarWhatsApp();
-        }, 5000);
+        agendarReconexao(5000);
     } finally {
-        isInitializing = false;
+        isStarting = false;
     }
 }
 
@@ -216,7 +236,7 @@ app.get("/qrcode", (req, res) => {
         });
     }
 
-    // Se estiver desconectado e sem QR Code, forcar inicializacao
+    // Se estiver desconectado e sem QR Code, forcar inicializacao segura
     if (!sock || connectionStatus === "desconectado") {
         iniciarWhatsApp();
     }
@@ -266,7 +286,7 @@ app.post("/send-text", async (req, res) => {
 app.post("/disconnect", async (req, res) => {
     try {
         await limparSessao();
-        setTimeout(iniciarWhatsApp, 1500);
+        agendarReconexao(1500);
         res.json({ sucesso: true, mensagem: "Desconectado e resetado com sucesso" });
     } catch (err) {
         res.status(500).json({ sucesso: false, erro: err.message });
@@ -277,7 +297,7 @@ app.post("/disconnect", async (req, res) => {
 app.get("/reset", async (req, res) => {
     try {
         await limparSessao();
-        setTimeout(iniciarWhatsApp, 1500);
+        agendarReconexao(1500);
         res.json({
             sucesso: true,
             mensagem: "Sessao antiga limpa com sucesso! Aguarde 5 segundos e gere o novo QR Code."
