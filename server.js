@@ -42,8 +42,14 @@ const msgRetryCounterCache = {
 };
 
 // Armazenamento em memória das mensagens enviadas recentemente para responder a pedidos de chave/retry do WhatsApp
-// Isso resolve o problema de "Aguardando mensagem. Essa ação pode levar alguns instantes..."
 const recentMessagesStore = new Map();
+
+// Rastreio de mensagens enviadas pela API/Robô para saber diferenciar de quando o Alexandre digita no celular da loja
+const botSentMessageIds = new Set();
+
+// Mapa de conversas pausadas porque o Alexandre (humano) conversou com o cliente (remoteJid -> timestamp até quando silenciar)
+const humanPausedUntil = new Map();
+const PAUSA_HUMANA_MS = 2 * 60 * 60 * 1000; // 2 horas de silêncio para o robô quando o Alexandre fala com o cliente
 
 // Salvar todos os arquivos de autenticação no banco da HostGator
 async function salvarSessaoRemota() {
@@ -137,10 +143,7 @@ async function resolverJidValido(numeroOuJid) {
     if (!numeroOuJid) return null;
     let raw = String(numeroOuJid).trim();
 
-    // Se já é LID
     if (raw.endsWith("@lid")) return raw;
-
-    // Se já veio com @s.whatsapp.net, extrai o número para validação
     if (raw.endsWith("@s.whatsapp.net")) {
         raw = raw.replace("@s.whatsapp.net", "");
     }
@@ -150,21 +153,17 @@ async function resolverJidValido(numeroOuJid) {
 
     if (clean.length > 13) return `${clean}@lid`;
 
-    // Se número brasileiro sem DDI 55 (10 ou 11 dígitos), prefixa 55
     if (clean.length === 10 || clean.length === 11) {
         clean = "55" + clean;
     }
 
     if (sock && connectionStatus === "conectado") {
         try {
-            // 1. Consulta com o número exato fornecido
             const r1 = await sock.onWhatsApp(clean);
             if (r1 && r1.length > 0 && r1[0].exists && r1[0].jid) {
                 return r1[0].jid;
             }
 
-            // 2. No Brasil, se tiver 13 dígitos (55 + DDD + 9 + 8 dígitos)
-            // No WhatsApp, muitas contas antigas foram registradas SEM o 9º dígito (12 dígitos)
             if (clean.startsWith("55") && clean.length === 13 && clean[4] === "9") {
                 const sem9 = clean.slice(0, 4) + clean.slice(5);
                 const r2 = await sock.onWhatsApp(sem9);
@@ -174,7 +173,6 @@ async function resolverJidValido(numeroOuJid) {
                 }
             }
 
-            // 3. No Brasil, se tiver 12 dígitos (55 + DDD + 8 dígitos), tenta COM o nono dígito
             if (clean.startsWith("55") && clean.length === 12) {
                 const com9 = clean.slice(0, 4) + "9" + clean.slice(4);
                 const r3 = await sock.onWhatsApp(com9);
@@ -196,7 +194,6 @@ async function iniciarWhatsApp() {
     isStarting = true;
 
     try {
-        // Matar qualquer conexao fantasma antes de iniciar uma nova
         encerrarSocketAtual();
 
         const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
@@ -272,9 +269,12 @@ async function iniciarWhatsApp() {
             }
         });
 
-        // Delay Inteligente (10s) para IA nao atropelar atendente humano
+        // =========================================================================
+        // ATENDIMENTO INTELIGENTE: PAUSA HUMANA DE 2 HORAS E AGROPAMENTO DE MENSAGENS
+        // =========================================================================
         const pendingTimers = new Map();
-        const DELAY_RESPOSTA_MS = 10000;
+        const pendingMessages = new Map();
+        const DELAY_RESPOSTA_MS = 25000; // 25 segundos para esperar o cliente terminar de digitar e dar tempo do Alexandre responder no celular se quiser
 
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
             if (type !== "notify") return;
@@ -287,16 +287,44 @@ async function iniciarWhatsApp() {
                     continue;
                 }
 
-                // 1. SE FOI O ATENDENTE HUMANO (ALEXANDRE) QUEM MANDOU MENSAGEM:
+                // 1. SE FOI O NOSSO WHATSAPP QUE MANDOU A MENSAGEM (fromMe === true):
                 if (msg.key.fromMe) {
+                    // Se foi o próprio robô que disparou via API (/send-text, garantia, etc):
+                    if (botSentMessageIds.has(msg.key.id)) {
+                        botSentMessageIds.delete(msg.key.id);
+                        continue;
+                    }
+
+                    // FOI O ALEXANDRE DIGITANDO MANUALMENTE NO CELULAR DA LOJA!
+                    console.log(`[FOXCELL] 🛑 Atendente Alexandre mandou mensagem para ${remoteJid}! Agatha SILENCIADA para este cliente por 2 horas.`);
+
+                    // Cancela qualquer resposta que a Agatha estava prestes a enviar
                     if (pendingTimers.has(remoteJid)) {
                         clearTimeout(pendingTimers.get(remoteJid));
                         pendingTimers.delete(remoteJid);
-                        console.log(`[FOXCELL] Resposta da Agatha CANCELADA pois o atendente assumiu a conversa!`);
                     }
+                    pendingMessages.delete(remoteJid);
+
+                    // Silencia o robô para este contato por 2 horas
+                    humanPausedUntil.set(remoteJid, Date.now() + PAUSA_HUMANA_MS);
+
+                    // Avisa a HostGator para gravar na tabela sistema_whatsapp_pausas
+                    try {
+                        const phone = remoteJid.split("@")[0];
+                        axios.post(WEBHOOK_URL, {
+                            phone,
+                            jid: remoteJid,
+                            senderName: "Alexandre",
+                            message: "[Atendente Humano Falou]",
+                            fromMe: true,
+                            isGroup: false
+                        }, { timeout: 8000 }).catch(() => {});
+                    } catch (e) {}
+
                     continue;
                 }
 
+                // 2. SE FOI UMA MENSAGEM RECEBIDA DO CLIENTE (fromMe === false):
                 const text =
                     msg.message.conversation ||
                     msg.message.extendedTextMessage?.text ||
@@ -305,26 +333,60 @@ async function iniciarWhatsApp() {
 
                 if (!text || !text.trim()) continue;
 
+                const textClean = text.trim().toLowerCase();
+
+                // Se o cliente explicitamente chamar a Agatha por comando, encerra a pausa humana
+                if (["agatha", "robô", "robo", "bot", "#menu", "menu"].includes(textClean)) {
+                    humanPausedUntil.delete(remoteJid);
+                    console.log(`[FOXCELL] 🤖 Cliente chamou a Agatha explicitamente: reativando robô para ${remoteJid}!`);
+                }
+
+                // Verifica se este contato está silenciado porque o Alexandre está conversando com ele
+                const pausadoAte = humanPausedUntil.get(remoteJid) || 0;
+                if (Date.now() < pausadoAte) {
+                    const minRestantes = Math.round((pausadoAte - Date.now()) / 60000);
+                    console.log(`[FOXCELL] 🤫 Mensagem de ${remoteJid} ignorada pelo robô pois o Alexandre está conversando com o cliente (${minRestantes} min restantes de pausa).`);
+                    continue;
+                }
+
                 const senderName = msg.pushName || "Cliente";
                 const phone = remoteJid.split("@")[0];
 
+                // Acumula mensagens picadas do cliente para responder tudo de uma vez
+                if (!pendingMessages.has(remoteJid)) {
+                    pendingMessages.set(remoteJid, []);
+                }
+                pendingMessages.get(remoteJid).push(text.trim());
+
+                // Reinicia o timer a cada nova mensagem para esperar o cliente terminar de falar
                 if (pendingTimers.has(remoteJid)) {
                     clearTimeout(pendingTimers.get(remoteJid));
                 }
 
-                console.log(`[FOXCELL] Aguardando ${DELAY_RESPOSTA_MS / 1000}s de delay para ${senderName}. Se o Alexandre responder, a IA é cancelada.`);
-                
+                console.log(`[FOXCELL] ⏳ Mensagem de ${senderName} recebida. Aguardando ${DELAY_RESPOSTA_MS / 1000}s para dar tempo do Alexandre responder ou o cliente terminar de digitar...`);
+
                 const timerId = setTimeout(async () => {
                     pendingTimers.delete(remoteJid);
+                    const todasMensagens = pendingMessages.get(remoteJid) || [text];
+                    pendingMessages.delete(remoteJid);
+
+                    // Re-valida se o Alexandre não começou a falar nesse intervalo
+                    if (Date.now() < (humanPausedUntil.get(remoteJid) || 0)) {
+                        console.log(`[FOXCELL] Envio cancelado: Alexandre mandou mensagem.`);
+                        return;
+                    }
+
+                    const textoFinal = todasMensagens.join("\n");
+
                     try {
-                        console.log(`[FOXCELL] Enviando mensagem de ${senderName} para a Agatha na HostGator...`);
-                        const resp = await axios.post(
+                        console.log(`[FOXCELL] Enviando mensagem agrupada de ${senderName} para a Agatha na HostGator...`);
+                        await axios.post(
                             WEBHOOK_URL,
                             {
                                 phone,
                                 jid: remoteJid,
                                 senderName,
-                                message: text,
+                                message: textoFinal,
                                 fromMe: false,
                                 isGroup: false
                             },
@@ -333,7 +395,6 @@ async function iniciarWhatsApp() {
                                 timeout: 25000 
                             }
                         );
-                        console.log(`[FOXCELL] Webhook HostGator respondeu status ${resp.status}`);
                     } catch (webhookErr) {
                         console.error("[FOXCELL] Erro ao repassar para webhook HostGator:", webhookErr.message);
                     }
@@ -360,6 +421,7 @@ app.get("/", (req, res) => {
         app: "FoxCell WhatsApp Baileys Microservice",
         status: connectionStatus,
         numero: connectedNumber,
+        pausasAtivas: humanPausedUntil.size,
         timestamp: new Date().toISOString()
     });
 });
@@ -404,7 +466,7 @@ app.get("/qrcode", (req, res) => {
     });
 });
 
-// 4. Enviar Mensagem de Texto (com suporte a JID direto, LID, resolução do 9º dígito e pré-aquecimento Signal)
+// 4. Enviar Mensagem de Texto
 app.post("/send-text", async (req, res) => {
     const { phone, jid: directJid, message } = req.body;
 
@@ -424,7 +486,7 @@ app.post("/send-text", async (req, res) => {
             return res.status(400).json({ sucesso: false, erro: "Destinatário inválido" });
         }
 
-        // Pré-aquecimento da sessão de criptografia (evita 'Aguardando mensagem...' no cliente)
+        // Pré-aquecimento da sessão de criptografia
         try {
             await sock.presenceSubscribe(jid);
             await sock.sendPresenceUpdate("composing", jid);
@@ -434,12 +496,20 @@ app.post("/send-text", async (req, res) => {
 
         const sent = await sock.sendMessage(jid, { text: message });
 
-        // Salva a mensagem no cache para responder instantaneamente a requisições de chave/retry
-        if (sent && sent.key && sent.key.id && sent.message) {
-            recentMessagesStore.set(sent.key.id, sent.message);
-            if (recentMessagesStore.size > 300) {
-                const firstKey = recentMessagesStore.keys().next().value;
-                recentMessagesStore.delete(firstKey);
+        if (sent && sent.key && sent.key.id) {
+            // Registra para o robô saber que FOI ELE QUEM MANDOU e não o Alexandre
+            botSentMessageIds.add(sent.key.id);
+            if (botSentMessageIds.size > 500) {
+                const first = botSentMessageIds.values().next().value;
+                botSentMessageIds.delete(first);
+            }
+
+            if (sent.message) {
+                recentMessagesStore.set(sent.key.id, sent.message);
+                if (recentMessagesStore.size > 300) {
+                    const firstKey = recentMessagesStore.keys().next().value;
+                    recentMessagesStore.delete(firstKey);
+                }
             }
         }
 
@@ -482,7 +552,6 @@ app.post("/send-image", async (req, res) => {
             imageBuffer = Buffer.from(image, "base64");
         }
 
-        // Pré-aquecimento da sessão de criptografia
         try {
             await sock.presenceSubscribe(jid);
             await sock.sendPresenceUpdate("composing", jid);
@@ -495,11 +564,19 @@ app.post("/send-image", async (req, res) => {
             caption: caption || "" 
         });
 
-        if (sent && sent.key && sent.key.id && sent.message) {
-            recentMessagesStore.set(sent.key.id, sent.message);
-            if (recentMessagesStore.size > 300) {
-                const firstKey = recentMessagesStore.keys().next().value;
-                recentMessagesStore.delete(firstKey);
+        if (sent && sent.key && sent.key.id) {
+            botSentMessageIds.add(sent.key.id);
+            if (botSentMessageIds.size > 500) {
+                const first = botSentMessageIds.values().next().value;
+                botSentMessageIds.delete(first);
+            }
+
+            if (sent.message) {
+                recentMessagesStore.set(sent.key.id, sent.message);
+                if (recentMessagesStore.size > 300) {
+                    const firstKey = recentMessagesStore.keys().next().value;
+                    recentMessagesStore.delete(firstKey);
+                }
             }
         }
 
@@ -511,7 +588,28 @@ app.post("/send-image", async (req, res) => {
     }
 });
 
-// 6. Desconectar
+// 6. Pausar / Despausar Manualmente um Cliente
+app.post("/pause-chat", (req, res) => {
+    const { phone, jid, hours = 2 } = req.body;
+    const target = jid || phone;
+    if (target) {
+        humanPausedUntil.set(target, Date.now() + hours * 3600 * 1000);
+        return res.json({ sucesso: true, mensagem: `Chat pausado por ${hours} horas` });
+    }
+    res.status(400).json({ sucesso: false, erro: "Telefone ou JID obrigatório" });
+});
+
+app.post("/unpause-chat", (req, res) => {
+    const { phone, jid } = req.body;
+    const target = jid || phone;
+    if (target) {
+        humanPausedUntil.delete(target);
+        return res.json({ sucesso: true, mensagem: "Chat despausado" });
+    }
+    res.status(400).json({ sucesso: false, erro: "Telefone ou JID obrigatório" });
+});
+
+// 7. Desconectar
 app.post("/disconnect", async (req, res) => {
     try {
         await limparSessao();
@@ -522,7 +620,7 @@ app.post("/disconnect", async (req, res) => {
     }
 });
 
-// 7. Resetar Sessao (Gera QR Code 100% novo)
+// 8. Resetar Sessao
 app.get("/reset", async (req, res) => {
     try {
         await limparSessao();
@@ -533,26 +631,6 @@ app.get("/reset", async (req, res) => {
         });
     } catch (err) {
         res.status(500).json({ sucesso: false, erro: err.message });
-    }
-});
-
-// 8. Teste de conexao com Webhook HostGator
-app.get("/test-webhook", async (req, res) => {
-    try {
-        const resp = await axios.post(
-            WEBHOOK_URL,
-            {
-                phone: "558588599960",
-                senderName: "Teste Webhook",
-                message: "Oi",
-                fromMe: false,
-                isGroup: false
-            },
-            { headers: { "Content-Type": "application/json" }, timeout: 25000 }
-        );
-        res.json({ sucesso: true, webhookUrl: WEBHOOK_URL, statusWebhook: resp.status, data: resp.data });
-    } catch (e) {
-        res.status(500).json({ sucesso: false, webhookUrl: WEBHOOK_URL, erro: e.message });
     }
 });
 
