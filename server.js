@@ -10,6 +10,7 @@ import QRCode from "qrcode";
 import axios from "axios";
 import pino from "pino";
 import fs from "fs";
+import path from "path";
 
 const app = express();
 app.use(cors());
@@ -30,6 +31,18 @@ const logger = pino({ level: "silent" });
 
 const SYNC_URL = process.env.SYNC_URL || "https://www.avenda.online/sistema/api/whatsapp_auth_sync.php";
 let syncTimeout = null;
+
+// Cache para rastrear tentativas de reenvio do Baileys e evitar loops
+const msgRetryCounterCache = {
+    _cache: new Map(),
+    get(key) { return this._cache.get(key); },
+    set(key, value) { this._cache.set(key, value); },
+    del(key) { this._cache.delete(key); }
+};
+
+// Armazenamento em memória das mensagens enviadas recentemente para responder a pedidos de chave/retry do WhatsApp
+// Isso resolve o problema de "Aguardando mensagem. Essa ação pode levar alguns instantes..."
+const recentMessagesStore = new Map();
 
 // Salvar todos os arquivos de autenticação no banco da HostGator
 async function salvarSessaoRemota() {
@@ -59,69 +72,55 @@ async function salvarSessaoRemota() {
 // Restaurar os arquivos de autenticação a partir do banco da HostGator
 async function restaurarSessaoRemota() {
     try {
-        if (fs.existsSync(AUTH_FOLDER) && fs.existsSync(path.join(AUTH_FOLDER, "creds.json"))) {
-            console.log("[FOXCELL] Sessão local já existente.");
-            return true;
-        }
-
-        console.log("[FOXCELL] Buscando sessão salva no banco da HostGator...");
-        const resp = await axios.get(SYNC_URL, { timeout: 12000 });
-        if (resp.data?.tem_sessao && resp.data?.session_data) {
+        console.log("[FOXCELL] 📥 Verificando se existe sessão salva no MySQL da HostGator...");
+        const resp = await axios.get(SYNC_URL, { timeout: 15000 });
+        if (resp.data && resp.data.sucesso && resp.data.session_data) {
             if (!fs.existsSync(AUTH_FOLDER)) {
                 fs.mkdirSync(AUTH_FOLDER, { recursive: true });
             }
 
             const sessionData = resp.data.session_data;
-            let count = 0;
-            for (const [filename, content] of Object.entries(sessionData)) {
-                fs.writeFileSync(path.join(AUTH_FOLDER, filename), content, "utf-8");
-                count++;
-            }
+            const filenames = Object.keys(sessionData);
 
-            console.log(`[FOXCELL] 🔄 Sessão RESTAURADA com sucesso da HostGator (${count} arquivos)! Conectando sem QR Code...`);
-            return true;
-        } else {
-            console.log("[FOXCELL] Nenhuma sessão salva encontrada na HostGator. Aguardando leitura de QR Code.");
+            if (filenames.includes("creds.json")) {
+                for (const filename of filenames) {
+                    const filePath = path.join(AUTH_FOLDER, filename);
+                    fs.writeFileSync(filePath, sessionData[filename], "utf-8");
+                }
+                console.log(`[FOXCELL] ✅ Sessão restaurada com sucesso do banco! (${filenames.length} arquivos gravados).`);
+                return true;
+            }
         }
     } catch (err) {
-        console.error("[FOXCELL] Aviso ao restaurar sessão da HostGator:", err.message);
+        console.log("[FOXCELL] Nenhuma sessão prévia restaurada do MySQL:", err.message);
     }
     return false;
 }
 
-// Encerrar socket anterior para evitar conflito 440 (connection replaced)
-function encerrarSocketAtual() {
-    if (sock) {
-        try {
-            sock.ev.removeAllListeners("connection.update");
-            sock.ev.removeAllListeners("creds.update");
-            sock.ev.removeAllListeners("messages.upsert");
-            if (sock.ws) {
-                sock.ws.close();
-            }
-            sock.end(undefined);
-        } catch (e) {}
-        sock = null;
-    }
-}
-
-// Limpeza forçada de sessão
+// Limpar sessão local e banco
 async function limparSessao() {
-    if (reconnectTimeout) {
-        clearTimeout(reconnectTimeout);
-        reconnectTimeout = null;
-    }
-    encerrarSocketAtual();
     try {
         if (fs.existsSync(AUTH_FOLDER)) {
             fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
         }
-        await axios.get(`${SYNC_URL}?acao=limpar`, { timeout: 6000 }).catch(() => {});
+        await axios.post(SYNC_URL, { action: "limpar" }, { timeout: 10000 });
     } catch (e) {}
     connectionStatus = "desconectado";
     currentQrCodeBase64 = null;
     connectedNumber = null;
     console.log("[FOXCELL] Sessão limpa completamente (local e banco da HostGator).");
+}
+
+function encerrarSocketAtual() {
+    if (sock) {
+        try {
+            sock.ev.removeAllListeners();
+            if (sock.ws) {
+                sock.ws.close();
+            }
+        } catch (e) {}
+        sock = null;
+    }
 }
 
 function agendarReconexao(ms = 5000) {
@@ -130,6 +129,65 @@ function agendarReconexao(ms = 5000) {
         reconnectTimeout = null;
         iniciarWhatsApp();
     }, ms);
+}
+
+// Resolve e valida o JID canônico no WhatsApp (trata DDI 55 e a variação do 9º dígito no Brasil)
+async function resolverJidValido(numeroOuJid) {
+    if (!numeroOuJid) return null;
+    let raw = String(numeroOuJid).trim();
+
+    // Se já é LID
+    if (raw.endsWith("@lid")) return raw;
+
+    // Se já veio com @s.whatsapp.net, extrai o número para validação
+    if (raw.endsWith("@s.whatsapp.net")) {
+        raw = raw.replace("@s.whatsapp.net", "");
+    }
+
+    let clean = raw.replace(/\D/g, "");
+    if (!clean) return null;
+
+    if (clean.length > 13) return `${clean}@lid`;
+
+    // Se número brasileiro sem DDI 55 (10 ou 11 dígitos), prefixa 55
+    if (clean.length === 10 || clean.length === 11) {
+        clean = "55" + clean;
+    }
+
+    if (sock && connectionStatus === "conectado") {
+        try {
+            // 1. Consulta com o número exato fornecido
+            const r1 = await sock.onWhatsApp(clean);
+            if (r1 && r1.length > 0 && r1[0].exists && r1[0].jid) {
+                return r1[0].jid;
+            }
+
+            // 2. No Brasil, se tiver 13 dígitos (55 + DDD + 9 + 8 dígitos)
+            // No WhatsApp, muitas contas antigas foram registradas SEM o 9º dígito (12 dígitos)
+            if (clean.startsWith("55") && clean.length === 13 && clean[4] === "9") {
+                const sem9 = clean.slice(0, 4) + clean.slice(5);
+                const r2 = await sock.onWhatsApp(sem9);
+                if (r2 && r2.length > 0 && r2[0].exists && r2[0].jid) {
+                    console.log(`[FOXCELL] JID ajustado (sem nono dígito): ${clean} -> ${r2[0].jid}`);
+                    return r2[0].jid;
+                }
+            }
+
+            // 3. No Brasil, se tiver 12 dígitos (55 + DDD + 8 dígitos), tenta COM o nono dígito
+            if (clean.startsWith("55") && clean.length === 12) {
+                const com9 = clean.slice(0, 4) + "9" + clean.slice(4);
+                const r3 = await sock.onWhatsApp(com9);
+                if (r3 && r3.length > 0 && r3[0].exists && r3[0].jid) {
+                    console.log(`[FOXCELL] JID ajustado (com nono dígito): ${clean} -> ${r3[0].jid}`);
+                    return r3[0].jid;
+                }
+            }
+        } catch (err) {
+            console.error("[FOXCELL] Falha na consulta onWhatsApp:", err.message);
+        }
+    }
+
+    return `${clean}@s.whatsapp.net`;
 }
 
 async function iniciarWhatsApp() {
@@ -152,7 +210,16 @@ async function iniciarWhatsApp() {
             syncFullHistory: false,
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 0,
-            keepAliveIntervalMs: 25000
+            keepAliveIntervalMs: 25000,
+            msgRetryCounterCache,
+            getMessage: async (key) => {
+                if (key && key.id && recentMessagesStore.has(key.id)) {
+                    return recentMessagesStore.get(key.id);
+                }
+                return {
+                    conversation: "FoxCell Assistência Técnica"
+                };
+            }
         });
 
         sock.ev.on("creds.update", async () => {
@@ -198,81 +265,52 @@ async function iniciarWhatsApp() {
                 }
                 connectionStatus = "conectado";
                 currentQrCodeBase64 = null;
-                connectedNumber = sock.user?.id?.split(":")[0] || "FoxCell";
-                console.log(`[FOXCELL] WhatsApp Conectado com sucesso! Numero: ${connectedNumber}`);
+                connectedNumber = sock.user?.id ? sock.user.id.split(":")[0] : "Desconhecido";
+                console.log(`[FOXCELL] Conectado com sucesso no WhatsApp! Numero: ${connectedNumber}`);
+                salvarSessaoRemota();
             }
         });
 
-const pendingTimers = new Map();
-const DELAY_RESPOSTA_MS = parseInt(process.env.DELAY_RESPOSTA_MS || "10000", 10); // 10 segundos de delay para atendimento humano
+        // Delay Inteligente (10s) para IA nao atropelar atendente humano
+        const pendingTimers = new Map();
+        const DELAY_RESPOSTA_MS = 10000;
 
-        // Recebimento de Mensagens
-        sock.ev.on("messages.upsert", async ({ messages }) => {
+        sock.ev.on("messages.upsert", async ({ messages, type }) => {
+            if (type !== "notify") return;
+
             for (const msg of messages) {
-                const remoteJid = msg.key.remoteJid;
-                if (!remoteJid || remoteJid.includes("@g.us") || remoteJid === "status@broadcast") continue;
-                const phone = remoteJid.replace(/\D/g, "");
+                if (!msg.message) continue;
 
-                // Se foi o Alexandre (loja) quem enviou a mensagem pelo WhatsApp:
+                const remoteJid = msg.key.remoteJid;
+                if (!remoteJid || remoteJid.includes("@g.us") || remoteJid === "status@broadcast") {
+                    continue;
+                }
+
+                // 1. SE FOI O ATENDENTE HUMANO (ALEXANDRE) QUEM MANDOU MENSAGEM:
                 if (msg.key.fromMe) {
-                    console.log(`[FOXCELL] Atendente Alexandre respondeu para ${phone} (JID: ${remoteJid}).`);
-                    
-                    // Cancela qualquer envio automático pendente para este cliente
                     if (pendingTimers.has(remoteJid)) {
                         clearTimeout(pendingTimers.get(remoteJid));
                         pendingTimers.delete(remoteJid);
                         console.log(`[FOXCELL] Resposta da Agatha CANCELADA pois o atendente assumiu a conversa!`);
                     }
-
-                    // Notifica a HostGator para registrar pausa humana de 1h no banco
-                    try {
-                        await axios.post(WEBHOOK_URL, {
-                            phone,
-                            jid: remoteJid,
-                            senderName: "Alexandre FoxCell",
-                            message: "atendente_assumiu",
-                            fromMe: true,
-                            isGroup: false
-                        }, { headers: { "Content-Type": "application/json" }, timeout: 6000 });
-                    } catch (e) {}
-
                     continue;
                 }
 
-                if (!msg.message) continue;
-
-                const senderName = msg.pushName || "Cliente";
-
-                // Desembrulhar mensagens modernas do WhatsApp
-                let m = msg.message;
-                if (m.ephemeralMessage) m = m.ephemeralMessage.message;
-                if (m.viewOnceMessage) m = m.viewOnceMessage.message;
-                if (m.viewOnceMessageV2) m = m.viewOnceMessageV2.message;
-
-                // Extrair texto da mensagem
                 const text =
-                    m?.conversation ||
-                    m?.extendedTextMessage?.text ||
-                    m?.imageMessage?.caption ||
-                    m?.videoMessage?.caption ||
+                    msg.message.conversation ||
+                    msg.message.extendedTextMessage?.text ||
+                    msg.message.imageMessage?.caption ||
                     "";
 
-                if (!text.trim()) continue;
+                if (!text || !text.trim()) continue;
 
-                console.log(`[FOXCELL] Mensagem recebida de ${senderName} (${phone} | JID: ${remoteJid}): "${text}"`);
+                const senderName = msg.pushName || "Cliente";
+                const phone = remoteJid.split("@")[0];
 
-                // 1. Simular status "Digitando..." no WhatsApp
-                try {
-                    await sock.sendPresenceUpdate("composing", remoteJid);
-                } catch (e) {}
-
-                // Se o cliente mandou mais de uma mensagem seguida, renova o timer para responder tudo de uma vez
                 if (pendingTimers.has(remoteJid)) {
                     clearTimeout(pendingTimers.get(remoteJid));
                 }
 
-                // 2. Aguarda o Delay Humano (10 segundos) antes de responder
-                // Se o Alexandre mandar mensagem durante esses 10 segundos, a IA é cancelada na hora!
                 console.log(`[FOXCELL] Aguardando ${DELAY_RESPOSTA_MS / 1000}s de delay para ${senderName}. Se o Alexandre responder, a IA é cancelada.`);
                 
                 const timerId = setTimeout(async () => {
@@ -318,29 +356,31 @@ const DELAY_RESPOSTA_MS = parseInt(process.env.DELAY_RESPOSTA_MS || "10000", 10)
 // 1. Healthcheck
 app.get("/", (req, res) => {
     res.json({
-        app: "FoxCell WhatsApp Microservice",
+        app: "FoxCell WhatsApp Baileys Microservice",
         status: connectionStatus,
-        connectedNumber,
-        uptime: process.uptime()
+        numero: connectedNumber,
+        timestamp: new Date().toISOString()
     });
 });
 
-// 2. Status
+// 2. Status da Conexao
 app.get("/status", (req, res) => {
     res.json({
-        sucesso: true,
+        conectado: connectionStatus === "conectado",
         status: connectionStatus,
-        numero: connectedNumber
+        numero: connectedNumber,
+        temQrCode: !!currentQrCodeBase64
     });
 });
 
-// 3. QR Code
+// 3. Obter QR Code
 app.get("/qrcode", (req, res) => {
     if (connectionStatus === "conectado") {
         return res.json({
             sucesso: true,
             status: "conectado",
-            numero: connectedNumber
+            numero: connectedNumber,
+            mensagem: "WhatsApp ja esta conectado!"
         });
     }
 
@@ -352,7 +392,6 @@ app.get("/qrcode", (req, res) => {
         });
     }
 
-    // Se estiver desconectado e sem QR Code, forcar inicializacao segura
     if (!sock || connectionStatus === "desconectado") {
         iniciarWhatsApp();
     }
@@ -364,7 +403,7 @@ app.get("/qrcode", (req, res) => {
     });
 });
 
-// 4. Enviar Mensagem de Texto (com suporte a JID direto, LID e número normal)
+// 4. Enviar Mensagem de Texto (com suporte a JID direto, LID, resolução do 9º dígito e pré-aquecimento Signal)
 app.post("/send-text", async (req, res) => {
     const { phone, jid: directJid, message } = req.body;
 
@@ -377,32 +416,33 @@ app.post("/send-text", async (req, res) => {
     }
 
     try {
-        let jid = directJid;
+        const target = directJid || phone;
+        const jid = await resolverJidValido(target);
 
         if (!jid) {
-            const raw = String(phone || "").trim();
-            if (raw.includes("@")) {
-                jid = raw;
-            } else {
-                const clean = raw.replace(/\D/g, "");
-                // Se o identificador tiver mais de 13 dígitos, é um identificador de privacidade (LID) do WhatsApp!
-                if (clean.length > 13) {
-                    jid = `${clean}@lid`;
-                } else {
-                    jid = `${clean}@s.whatsapp.net`;
-                    try {
-                        const results = await sock.onWhatsApp(clean);
-                        if (results && results[0] && results[0].jid) {
-                            jid = results[0].jid;
-                        }
-                    } catch (waErr) {}
-                }
+            return res.status(400).json({ sucesso: false, erro: "Destinatário inválido" });
+        }
+
+        // Pré-aquecimento da sessão de criptografia (evita 'Aguardando mensagem...' no cliente)
+        try {
+            await sock.presenceSubscribe(jid);
+            await sock.sendPresenceUpdate("composing", jid);
+            await new Promise((r) => setTimeout(r, 400));
+            await sock.sendPresenceUpdate("paused", jid);
+        } catch (pErr) {}
+
+        const sent = await sock.sendMessage(jid, { text: message });
+
+        // Salva a mensagem no cache para responder instantaneamente a requisições de chave/retry
+        if (sent && sent.key && sent.key.id && sent.message) {
+            recentMessagesStore.set(sent.key.id, sent.message);
+            if (recentMessagesStore.size > 300) {
+                const firstKey = recentMessagesStore.keys().next().value;
+                recentMessagesStore.delete(firstKey);
             }
         }
 
-        await sock.sendMessage(jid, { text: message });
-        console.log(`[FOXCELL] Resposta da Agatha enviada para ${jid}`);
-
+        console.log(`[FOXCELL] Notificação/Mensagem enviada com sucesso para ${jid}`);
         return res.json({ sucesso: true, mensagem: "Enviado com sucesso", jid });
     } catch (err) {
         console.error("[FOXCELL] Erro ao enviar mensagem:", err);
@@ -410,7 +450,67 @@ app.post("/send-text", async (req, res) => {
     }
 });
 
-// 5. Desconectar
+// 5. Enviar Imagem / Foto (Base64 ou URL) com Legenda
+app.post("/send-image", async (req, res) => {
+    const { phone, jid: directJid, image, caption } = req.body;
+
+    if (!sock || connectionStatus !== "conectado") {
+        return res.status(400).json({ sucesso: false, erro: "WhatsApp nao esta conectado" });
+    }
+
+    if ((!phone && !directJid) || !image) {
+        return res.status(400).json({ sucesso: false, erro: "Telefone/JID e imagem sao obrigatorios" });
+    }
+
+    try {
+        const target = directJid || phone;
+        const jid = await resolverJidValido(target);
+
+        if (!jid) {
+            return res.status(400).json({ sucesso: false, erro: "Destinatário inválido" });
+        }
+
+        let imageBuffer;
+        if (image.startsWith("data:image")) {
+            const base64Data = image.split(",")[1];
+            imageBuffer = Buffer.from(base64Data, "base64");
+        } else if (image.startsWith("http")) {
+            const imgResp = await axios.get(image, { responseType: "arraybuffer", timeout: 15000 });
+            imageBuffer = Buffer.from(imgResp.data);
+        } else {
+            imageBuffer = Buffer.from(image, "base64");
+        }
+
+        // Pré-aquecimento da sessão de criptografia
+        try {
+            await sock.presenceSubscribe(jid);
+            await sock.sendPresenceUpdate("composing", jid);
+            await new Promise((r) => setTimeout(r, 400));
+            await sock.sendPresenceUpdate("paused", jid);
+        } catch (pErr) {}
+
+        const sent = await sock.sendMessage(jid, { 
+            image: imageBuffer, 
+            caption: caption || "" 
+        });
+
+        if (sent && sent.key && sent.key.id && sent.message) {
+            recentMessagesStore.set(sent.key.id, sent.message);
+            if (recentMessagesStore.size > 300) {
+                const firstKey = recentMessagesStore.keys().next().value;
+                recentMessagesStore.delete(firstKey);
+            }
+        }
+
+        console.log(`[FOXCELL] Imagem enviada para ${jid}`);
+        return res.json({ sucesso: true, mensagem: "Imagem enviada com sucesso", jid });
+    } catch (err) {
+        console.error("[FOXCELL] Erro ao enviar imagem:", err);
+        return res.status(500).json({ sucesso: false, erro: err.message });
+    }
+});
+
+// 6. Desconectar
 app.post("/disconnect", async (req, res) => {
     try {
         await limparSessao();
@@ -421,7 +521,7 @@ app.post("/disconnect", async (req, res) => {
     }
 });
 
-// 6. Resetar Sessao (Gera QR Code 100% novo)
+// 7. Resetar Sessao (Gera QR Code 100% novo)
 app.get("/reset", async (req, res) => {
     try {
         await limparSessao();
@@ -435,7 +535,7 @@ app.get("/reset", async (req, res) => {
     }
 });
 
-// 7. Teste de conexao com Webhook HostGator
+// 8. Teste de conexao com Webhook HostGator
 app.get("/test-webhook", async (req, res) => {
     try {
         const resp = await axios.post(
